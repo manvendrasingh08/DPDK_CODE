@@ -1,0 +1,348 @@
+===========================================================
+DPDK GRAPH – COMPLETE EXECUTION FLOW & REQUIRED STRUCTS
+===========================================================
+
+========================
+1) GLOBAL INITIALIZATION
+========================
+
+API:
+    rte_eal_init(argc, argv)
+
+Purpose:
+    Initializes DPDK Environment Abstraction Layer.
+
+Internally:
+    - Parses EAL arguments
+    - Initializes hugepage memory
+    - Sets up memzones
+    - Initializes per-lcore storage
+    - Detects NUMA
+    - Initializes timers, logs, PCI, etc.
+
+Without this → nothing in DPDK works.
+
+
+========================
+2) MEMORY FOR PACKETS
+========================
+
+STRUCT:
+    struct rte_mempool
+
+Created Using:
+    rte_pktmbuf_pool_create()
+
+Important Internal Structures:
+
+    struct rte_mbuf {
+        void *buf_addr;
+        uint16_t data_off;
+        uint16_t pkt_len;
+        uint16_t data_len;
+        uint16_t refcnt;
+        ...
+    };
+
+Flow:
+    - Hugepage memory allocated
+    - Divided into NB_MBUF objects
+    - Each object contains:
+        [rte_mbuf struct + packet buffer]
+
+Reason:
+    DPDK uses preallocated memory pools for zero malloc overhead.
+
+
+========================
+3) NODE DEFINITION (STATIC REGISTRATION)
+========================
+
+STRUCT REQUIRED:
+    struct rte_node_register
+
+Definition Example:
+
+    struct rte_node_register {
+        char name[RTE_NODE_NAMESIZE];
+        rte_node_process_t process;
+        uint16_t flags;
+        uint16_t nb_edges;
+        const char *next_nodes[];
+    };
+
+Important Flag:
+    RTE_NODE_SOURCE_F
+
+Meaning:
+    Node generates packets (entry point node).
+
+Registration API:
+    __rte_node_register(&node_struct);
+
+Internal Effect:
+    - Inserts node into global node list (TAILQ)
+    - Stores name
+    - Stores process function pointer
+    - Stores edge definitions
+
+Internal Global Storage:
+    Global linked list of registered nodes.
+
+
+========================
+4) GRAPH CREATION
+========================
+
+STRUCT REQUIRED:
+    struct rte_graph_param {
+        int socket_id;
+        uint16_t nb_node_patterns;
+        const char **node_patterns;
+    };
+
+API:
+    rte_graph_create("graph_name", &params);
+
+Execution Steps Internally:
+
+    1) Allocate struct rte_graph
+    2) Copy graph name
+    3) Match node_patterns against registered node list
+    4) Instantiate runtime node copies
+    5) Build adjacency list (edges)
+    6) Create per-edge object queues
+    7) Insert graph into global graph list
+
+Internal Core Structure:
+
+    struct rte_graph {
+        char name[];
+        rte_graph_t id;
+        uint32_t nb_nodes;
+        struct rte_node **nodes;
+        scheduler_state;
+        edge queues;
+        ...
+    };
+
+Global Storage:
+    Global graph_list (TAILQ of all graphs)
+
+
+========================
+5) GRAPH LOOKUP
+========================
+
+API:
+    rte_graph_lookup("graph_name")
+
+Purpose:
+    Retrieve graph pointer by name.
+
+Internally:
+    - Iterates over global graph_list
+    - Compares names
+    - Returns pointer
+
+Why Needed:
+    - Decouples creation and usage
+    - Supports multi-module apps
+    - Supports multi-lcore cloning
+
+
+========================
+6) NODE RUNTIME STRUCTURE
+========================
+
+Runtime Node Structure:
+
+    struct rte_node {
+        rte_node_t id;
+        rte_node_process_t process;
+        uint16_t nb_edges;
+        struct rte_node *next_nodes[];
+        object queues;
+        stats;
+        ...
+    };
+
+Important:
+    This is different from rte_node_register.
+    register = template
+    node     = runtime instance inside graph
+
+
+========================
+7) GRAPH EXECUTION
+========================
+
+API:
+    rte_graph_walk(graph);
+
+Execution Order Internally:
+
+    Step 1:
+        Identify SOURCE nodes.
+
+    Step 2:
+        Call their process() function.
+
+    Step 3:
+        If they enqueue objects:
+            Mark downstream nodes runnable.
+
+    Step 4:
+        Scheduler picks runnable nodes from the ready queue.
+
+    Step 5:
+        Calls process() on them.
+
+    Step 6:
+        Continue until no node has pending work.
+
+Graph Model:
+    Pull-based scheduling with batching.
+
+
+========================
+8) NODE PROCESS FUNCTION
+========================
+
+Prototype:
+
+    uint16_t process(
+        struct rte_graph *graph,
+        struct rte_node *node,
+        void **objs,
+        uint16_t nb_objs
+    );
+
+Parameters:
+
+    graph   → current graph instance
+    node    → current node
+    objs    → array of objects (usually rte_mbuf*)
+    nb_objs → number of objects
+
+Return:
+    Number of objects consumed/processed.
+
+
+========================
+9) ENQUEUE MECHANISM
+========================
+
+API:
+    rte_node_enqueue(graph, node, edge_id, objs, count);
+
+Internally:
+    - Locate edge queue
+    - Append objects
+    - Mark next node as runnable
+
+Important Concept:
+    Nodes NEVER call next node directly.
+    They enqueue → scheduler decides execution.
+
+This enables:
+    - Batch processing
+    - Cache locality
+    - Vectorized execution
+    - Lockless design
+
+
+========================
+10) PACKET LIFECYCLE
+========================
+
+Allocate:
+    rte_pktmbuf_alloc(pool)
+
+Flow:
+    Source Node
+        ↓
+    rte_node_enqueue()
+        ↓
+    Worker Node
+        ↓
+    rte_pktmbuf_free()
+
+Free:
+    rte_pktmbuf_free(mbuf)
+
+Internally:
+    - Decrement refcount
+    - Return to mempool
+
+
+========================
+11) NORMAL EXECUTION ORDER SUMMARY
+========================
+
+1) rte_eal_init()
+
+2) Create mempool
+   rte_pktmbuf_pool_create()
+
+3) Register nodes
+   __rte_node_register()
+
+4) Create graph
+   rte_graph_create()
+
+5) Lookup graph
+   rte_graph_lookup()
+
+6) Run scheduler
+   while(...) {
+       rte_graph_walk(graph);
+   }
+
+7) Destroy graph (optional)
+   rte_graph_destroy()
+
+
+========================
+12) INTERNAL GLOBAL DATA STRUCTURES
+========================
+
+Global:
+    TAILQ node_list
+    TAILQ graph_list
+
+Each Graph:
+    - name
+    - id
+    - node array
+    - adjacency list
+    - per-edge queues
+    - scheduler bitmap
+
+Each Node:
+    - process function
+    - next node pointers
+    - stats
+    - local object cache
+
+
+========================
+13) ARCHITECTURAL MODEL
+========================
+
+DPDK Graph is:
+
+    Directed Acyclic Processing Graph
+    Batch-based
+    Pull-scheduled
+    Lockless per-lcore
+
+Design Goal:
+    High-performance packet processing
+    Minimal function call overhead
+    Cache-friendly execution
+
+
+===========================================================
+END OF COMPLETE GRAPH EXECUTION MODEL
+===========================================================

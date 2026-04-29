@@ -1,0 +1,13 @@
+if the error says "is already primary running" or multi process have access to the socket"
+TO REMOVE RUNTIME STALENESS: 
+
+sudo rm -rf /var/run/dpdk
+sudo mkdir -p /var/run/dpdk
+sudo chmod 755 /var/run/dpdk
+
+sudo pkill -9 primary
+sudo pkill -9 secondary
+sudo pkill -9 dpdk
+OR
+ps -ef | grep dpdk
+sudo kill -9 <pid>
